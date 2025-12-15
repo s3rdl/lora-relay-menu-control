@@ -1,109 +1,185 @@
 # lora-relay-menu-control
 
-LoRa-based 4-channel relay controller using **LILYGO TTGO LoRa32 (ESP32 + SX1276 + OLED)** boards.
+LoRa-based 4-channel relay controller using **LILYGO TTGO LoRa32**  
+(ESP32 + SX1276 + SSD1306 OLED).
 
-This repo contains two Arduino sketches:
+This repository contains two Arduino sketches:
 
-- `sender/` – handheld / local controller with 4 buttons and an OLED UI
-- `receiver/` – remote relay board with 4 outputs and an OLED UI
+- `sender/` – handheld / local controller with buttons and OLED UI  
+- `receiver/` – remote relay board with 4 outputs and OLED UI  
 
-Both sides use LoRa to communicate and support:
+Both devices communicate via **LoRa** and stay fully synchronized.
 
-- 4 logical relay channels (SW0–SW3)
-- Configurable **auto-off relay** (which channel turns off automatically after a timeout)
-- **Menu button** on *both* sender and receiver to choose the auto-off relay
-- RSSI display for signal quality
+---
 
-## Features
+## Features (Overview)
 
-### Sender
+- 4 logical relay channels (**SW0–SW3**)
+- Bi-directional LoRa communication
+- Configurable **auto-off relay** (turns OFF automatically after timeout)
+- **Menu button on both devices** to select the auto-off relay
+- Automatic **state synchronization** from receiver to sender
+- OLED UI on both boards
+- GPL-3.0 licensed
 
-- 4 buttons (GPIO 2, 15, 13, 12) with `INPUT_PULLUP`
-- Each button toggles a channel and sends:  
-  `CNG x` (e.g. `CNG 0`, `CNG 1`, …)
-- Extra **menu button** (GPIO 34 by default) cycles which relay (0–3) is the **auto-off** relay
-- Sends `AOF x` (e.g. `AOF 2`) to update the receiver's auto-off channel
-- Shows on OLED:
-  - Which relay is auto-off: `AUTO: SWx`
-  - Logical states of SW0–SW3
-  - Last status string
-  - Link RSSI based on ACKs from the receiver
+---
 
-### Receiver
+## Sender
 
-- 4 relay outputs (GPIO 2, 15, 13, 12) as `OUTPUT`, active-LOW, matching the original project
-- Receives:
-  - `CNG x` → toggles SWx and drives the corresponding relay pin
-  - `AOF x` → changes which relay has auto-off
-- Auto-off behaviour:
-  - When the configured relay is turned ON, a timer starts
-  - After **10 seconds** the relay is turned OFF automatically
-- Extra **menu button** (GPIO 34 by default) to locally cycle auto-off relay
-  - Also sends `AOF x` back to the sender, keeping both in sync
-- Shows on OLED:
-  - Last received LoRa message
-  - RSSI of last packet
-  - Which relay is auto-off: `AUTO: SWx`
-  - States of all 4 relays
+### Hardware
 
-## Hardware
+- Board: **LILYGO TTGO LoRa32**
+- Buttons:
+  - GPIO `2`, `15`, `13`, `12`
+  - Wiring: GPIO → button → **GND**
+  - Mode: `INPUT_PULLUP`
+- Menu button:
+  - GPIO **14**
+  - Wiring: GPIO → button → **GND**
+- Status LED:
+  - GPIO `25`
 
-- Board: **LILYGO TTGO LoRa32 868/915 MHz** (ESP32 + SX1276 + SSD1306 OLED)
-- LoRa wiring: uses the board's default pins
-- OLED: uses default I2C on GPIO 21 (SDA) and GPIO 22 (SCL)
-- Make sure to select the correct board in Arduino IDE (e.g. TTGO LoRa32 or a compatible ESP32 LoRa board definition).
+### Function
 
-### Pins
+- Each button toggles a relay channel by sending  
+  `CNG x`
+- Menu button cycles the auto-off relay by sending  
+  `AOF x`
 
-Sender:
+### Sender OLED shows
 
-- Buttons: `2, 15, 13, 12` → to GND, with `INPUT_PULLUP`
-- Menu button: `34` → to GND, with `INPUT_PULLUP`
+- `AUTO: SWx` – selected auto-off relay
+- `RSSI:` – link RSSI of last received packet
+- `LAST TX` – last transmitted command
+- Relay states **as reported by the receiver**
+- `SYNC` indicator when a state update is received
 
-Receiver:
+The sender never guesses relay states.  
+All relay states come exclusively from receiver synchronization messages.
 
-- Relays: `2, 15, 13, 12` → `OUTPUT`, active-LOW (as in the original repo)
-- Menu button: `34` → to GND, with `INPUT_PULLUP`
+---
 
-You can change pins in the arrays / defines at the top of each sketch.
+## Receiver
+
+### Hardware
+
+- Board: **LILYGO TTGO LoRa32**
+- Relay outputs:
+  - GPIO `2`, `15`, `13`, `12`
+  - `OUTPUT`, **active-LOW**
+- Menu button:
+  - GPIO **14**
+  - Wiring: GPIO → button → **GND**
+
+### Function
+
+- Receives commands:
+  - `CNG x` – toggle relay `x`
+  - `AOF x` – select auto-off relay
+- Auto-off logic:
+  - When the selected relay turns ON, a timer starts
+  - After **10 seconds**, the relay is turned OFF automatically
+- Menu button can also locally change the auto-off relay
+
+### Receiver OLED shows
+
+- Last received LoRa message
+- Relay states (**SW0–SW3**)
+- Alternating info field (every **2 seconds**):
+  - `RSSI: -xx`
+  - `AUTO: SWx`
+
+---
+
+## State Synchronization
+
+The receiver is the **single source of truth**.
+
+After **any state change** (toggle, auto-off timeout, menu change),  
+the receiver sends a full state update:
+
+STA abcd
+
+Example:
+
+STA 1010
+
+Meaning:
+
+- SW0 = ON  
+- SW1 = OFF  
+- SW2 = ON  
+- SW3 = OFF  
+
+The sender updates its display immediately and briefly shows **SYNC**.
+
+This prevents:
+
+- inverted states
+- display desynchronization
+- incorrect UI after auto-off events
+
+---
 
 ## Protocol
 
-- Toggle commands:
-  - `CNG x` (ASCII string with length 5), where `x` is `0..3`
-- Auto-off configuration:
-  - `AOF x` (ASCII string with length 5), where `x` is `0..3`
-- ACKs:
-  - Receiver replies to `CNG x` with: `ACK CNG x`
-  - Receiver may also echo `AOF x` back to the sender
+| Command | Direction | Description |
+|-------|-----------|-------------|
+| `CNG x` | Sender → Receiver | Toggle relay `x` |
+| `AOF x` | Sender ↔ Receiver | Set auto-off relay |
+| `STA abcd` | Receiver → Sender | Relay state synchronization |
+| `GET 0` | Sender → Receiver | Request current state |
+| `ACK …` | Receiver → Sender | Optional acknowledgement |
 
-## Auto-off behaviour
+All messages are short ASCII strings.
 
-- Controlled by `autoOffRelayIndex` on both sides.
-- Auto-off delay is set to 10 s via:
+---
 
-```cpp
-const unsigned long AUTO_OFF_DURATION = 10000UL;
-```
+## Auto-off Timing
 
-on the receiver. Change this constant to adjust the timing.
+Defined in the receiver sketch:
 
-## Building
+const unsigned long AUTO_OFF_DURATION_MS = 10000UL;
 
-1. Install **Arduino IDE** (or PlatformIO).
-2. Install **ESP32 board support**.
-3. Install libraries:
-   - `LoRa` by Sandeep Mistry
-   - `Adafruit_GFX`
-   - `Adafruit_SSD1306`
-4. Open `sender/sender.ino` and `receiver/receiver.ino` as separate sketches or as two projects.
-5. Select the correct board (TTGO LoRa32 / ESP32 Dev Module with matching pinout).
-6. Flash each sketch to its board.
+Change this value to adjust the auto-off delay.
+
+---
+
+## Wiring Summary
+
+### Sender
+
+- Buttons: `2`, `15`, `13`, `12`
+- Menu button: `14`
+- LED: `25`
+
+### Receiver
+
+- Relays: `2`, `15`, `13`, `12` (active-LOW)
+- Menu button: `14`
+
+GPIO `34` / `35` are intentionally **not used**  
+(input-only, no internal pull-ups).
+
+---
+
+## Building & Flashing
+
+1. Install **Arduino IDE** or **PlatformIO**
+2. Install ESP32 board support
+3. Install required libraries:
+   - **LoRa** (Sandeep Mistry)
+   - **Adafruit_GFX**
+   - **Adafruit_SSD1306**
+4. Open `sender/sender.ino` and `receiver/receiver.ino`
+5. Select board: **TTGO LoRa32** (or compatible ESP32 LoRa board)
+6. Flash each sketch to its corresponding board
+
+---
 
 ## License
 
-This project is licensed under the **GNU General Public License v3.0 (GPL-3.0)**.
-
-For the full license text, see the official GNU GPL v3.0 page:
+This project is licensed under the  
+**GNU General Public License v3.0 (GPL-3.0)**.
 
 https://www.gnu.org/licenses/gpl-3.0.en.html
