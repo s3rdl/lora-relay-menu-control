@@ -20,11 +20,9 @@
 #define CONFIG_RST  23
 #define CONFIG_DIO0 26
 
-// 4 buttons (as original)
+// Buttons
 int pinsSw[4] = {2, 15, 13, 12};
-
-// Menu button (GPIO14 -> GND)
-#define MENU_BTN_PIN 14
+#define MENU_BTN_PIN 14   // GPIO14 -> GND
 
 // LED
 #define LED_PIN 25
@@ -34,28 +32,31 @@ const unsigned long LED_PULSE_MS = 120;
 const unsigned long DEBOUNCE_MS = 30;
 const unsigned long MENU_DEBOUNCE_MS = 50;
 
-// ACK wait (short, bounded)
-const unsigned long ACK_WAIT_MS = 300;
+// SYNC display timing
+const unsigned long SYNC_SHOW_MS = 800;
 
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
 String status = "WAITING...";
-String lastTx = "";     // last sent command shown in the right box
+String lastTx = "";
 int lastOne = 5;
 
-// UI layout like original sender
+// UI layout
 int xpos[4] = {90, 110, 90, 110};
 int ypos[4] = {36, 36, 52, 52};
 
-// Sender UI state
+// Real relay states (from receiver only!)
 bool states[4] = {0, 0, 0, 0};
 
-// Auto-off selection (synced via AOF x)
+// Auto-off selection
 int autoOffRelayIndex = 3;
 
-// Link RSSI from last received packet (ACK)
+// RSSI
 int linkRssi = 0;
 bool haveLinkRssi = false;
+
+// SYNC status timing
+unsigned long statusUntil = 0;
 
 struct Button {
   uint8_t pin;
@@ -70,6 +71,8 @@ Button menuBtn;
 
 bool ledOn = false;
 unsigned long ledUntil = 0;
+
+// ----------------- helpers -----------------
 
 void setBrightness(uint8_t contrast) {
   display.ssd1306_command(SSD1306_SETCONTRAST);
@@ -91,12 +94,10 @@ void ledService() {
 
 bool debounceUpdate(Button &b, unsigned long debounceMs) {
   bool r = digitalRead(b.pin);
-
   if (r != b.raw) {
     b.raw = r;
     b.changedAt = millis();
   }
-
   if ((millis() - b.changedAt) >= debounceMs) {
     if (b.stable != b.raw) {
       b.lastStable = b.stable;
@@ -107,6 +108,22 @@ bool debounceUpdate(Button &b, unsigned long debounceMs) {
   return false;
 }
 
+void setStatusTemp(const String &s, unsigned long ms) {
+  status = s;
+  statusUntil = millis() + ms;
+  drawUI();
+}
+
+void statusService() {
+  if (statusUntil && (long)(millis() - statusUntil) >= 0) {
+    statusUntil = 0;
+    status = "WAITING...";
+    drawUI();
+  }
+}
+
+// ----------------- UI -----------------
+
 void drawUI() {
   display.clearDisplay();
   display.setCursor(0, 4);
@@ -116,7 +133,6 @@ void drawUI() {
   display.print("SENDER");
   display.setFont(NULL);
 
-  // left: auto selection + RSSI + status
   display.setCursor(0, 16);
   display.print("AUTO:SW");
   display.print(autoOffRelayIndex);
@@ -129,7 +145,7 @@ void drawUI() {
   display.setCursor(0, 46);
   display.print(status);
 
-  // right: "LAST TX" box
+  // Right box
   display.fillRect(68, 0, 60, 2, 1);
 
   for (int i = 68; i < 128; i++)
@@ -144,20 +160,19 @@ void drawUI() {
       display.drawPixel(127, i, 1);
     }
 
-  display.setTextColor(1);
   display.setCursor(72, 8);
   display.print("LAST TX");
 
   display.setCursor(72, 20);
-  display.print(lastTx);   // <- only here
+  display.print(lastTx);
 
-  // button rectangles + local states
+  // Button rectangles
   for (int i = 0; i < 4; i++) {
     if (i == lastOne) display.fillRect(xpos[i], ypos[i], 16, 12, 1);
     else display.drawRect(xpos[i], ypos[i], 16, 12, 1);
   }
 
-  display.setTextColor(1);
+  // Real relay states
   display.setCursor(88, 34);  display.print(states[0]);
   display.setCursor(108, 34); display.print(states[1]);
   display.setCursor(88, 50);  display.print(states[2]);
@@ -166,44 +181,51 @@ void drawUI() {
   display.display();
 }
 
-void sendAndWaitAck(const String &out) {
-  lastTx = out;              // persist last TX for display
-  status = "SENDING...";
-  drawUI();
+// ----------------- LoRa -----------------
 
+void sendPacket(const String &out) {
+  lastTx = out;
+  setStatusTemp("SENDING...", 300);
   ledPulse();
 
   LoRa.beginPacket();
   LoRa.print(out);
   LoRa.endPacket();
+}
 
-  // wait briefly for reply; record RSSI only
-  haveLinkRssi = false;
+void handleIncoming() {
+  int packetSize = LoRa.parsePacket();
+  if (!packetSize) return;
 
-  unsigned long start = millis();
-  while (millis() - start < ACK_WAIT_MS) {
-    int packetSize = LoRa.parsePacket();
-    if (packetSize) {
-      // drain packet
-      String incoming = "";
-      while (LoRa.available()) incoming += (char)LoRa.read();
-      incoming.trim();
+  String incoming = "";
+  while (LoRa.available()) incoming += (char)LoRa.read();
+  incoming.trim();
 
-      linkRssi = LoRa.packetRssi();
-      haveLinkRssi = true;
+  linkRssi = LoRa.packetRssi();
+  haveLinkRssi = true;
 
-      // receiver may confirm auto-off selection
-      if (incoming.startsWith("AOF ")) {
-        int idx = incoming.charAt(4) - '0';
-        if (idx >= 0 && idx < 4) autoOffRelayIndex = idx;
-      }
-      break;
+  // --- STATE SYNC ---
+  if (incoming.startsWith("STA ") && incoming.length() >= 8) {
+    for (int i = 0; i < 4; i++) {
+      char c = incoming.charAt(4 + i);
+      if (c == '0' || c == '1') states[i] = (c == '1');
     }
+    setStatusTemp("SYNC", SYNC_SHOW_MS);
+    return;
   }
 
-  status = "WAITING...";
-  drawUI();
+  // --- Auto-off confirm ---
+  if (incoming.startsWith("AOF ") && incoming.length() >= 5) {
+    int idx = incoming.charAt(4) - '0';
+    if (idx >= 0 && idx < 4) {
+      autoOffRelayIndex = idx;
+      drawUI();
+    }
+    return;
+  }
 }
+
+// ----------------- setup / loop -----------------
 
 void setup() {
   pinMode(LED_PIN, OUTPUT);
@@ -211,63 +233,55 @@ void setup() {
 
   for (int i = 0; i < 4; i++) {
     pinMode(pinsSw[i], INPUT_PULLUP);
-    btn[i].pin = (uint8_t)pinsSw[i];
-    btn[i].raw = digitalRead(btn[i].pin);
-    btn[i].stable = btn[i].raw;
-    btn[i].lastStable = btn[i].stable;
-    btn[i].changedAt = millis();
+    btn[i] = { (uint8_t)pinsSw[i], digitalRead(pinsSw[i]),
+               digitalRead(pinsSw[i]), digitalRead(pinsSw[i]), millis() };
   }
 
   pinMode(MENU_BTN_PIN, INPUT_PULLUP);
-  menuBtn.pin = MENU_BTN_PIN;
-  menuBtn.raw = digitalRead(menuBtn.pin);
-  menuBtn.stable = menuBtn.raw;
-  menuBtn.lastStable = menuBtn.stable;
-  menuBtn.changedAt = millis();
+  menuBtn = { MENU_BTN_PIN, digitalRead(MENU_BTN_PIN),
+              digitalRead(MENU_BTN_PIN), digitalRead(MENU_BTN_PIN), millis() };
 
   Serial.begin(115200);
   Wire.begin(I2C_SDA, I2C_SCL);
 
-  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
-    while (1);
-  }
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) while (1);
   display.display();
   setBrightness(70);
 
   SPI.begin(CONFIG_CLK, CONFIG_MISO, CONFIG_MOSI, CONFIG_NSS);
   LoRa.setPins(CONFIG_NSS, CONFIG_RST, CONFIG_DIO0);
+  if (!LoRa.begin(868E6)) while (1);
 
-  if (!LoRa.begin(868E6)) {
-    while (1);
-  }
   LoRa.setSpreadingFactor(8);
   LoRa.setSignalBandwidth(125E3);
   LoRa.setCodingRate4(5);
   LoRa.setSyncWord(120);
   LoRa.setTxPower(20, PA_OUTPUT_PA_BOOST_PIN);
 
+  sendPacket("GET 0");   // initial sync
   drawUI();
 }
 
 void loop() {
   ledService();
+  statusService();
+  handleIncoming();
 
-  // 4 buttons: press = stable HIGH->LOW
+  // Relay buttons
   for (int i = 0; i < 4; i++) {
     if (debounceUpdate(btn[i], DEBOUNCE_MS)) {
       if (btn[i].lastStable == HIGH && btn[i].stable == LOW) {
         lastOne = i;
-        states[i] = !states[i];
-        sendAndWaitAck("CNG " + String(i));
+        sendPacket("CNG " + String(i));
       }
     }
   }
 
-  // Menu button: cycle auto-off relay and send config
+  // Menu button
   if (debounceUpdate(menuBtn, MENU_DEBOUNCE_MS)) {
     if (menuBtn.lastStable == HIGH && menuBtn.stable == LOW) {
       autoOffRelayIndex = (autoOffRelayIndex + 1) % 4;
-      sendAndWaitAck("AOF " + String(autoOffRelayIndex));
+      sendPacket("AOF " + String(autoOffRelayIndex));
     }
   }
 }
