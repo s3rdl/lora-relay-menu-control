@@ -98,6 +98,67 @@ All relay states come exclusively from receiver synchronization messages.
 
 ---
 
+## Web UI (Receiver)
+
+The receiver provides a built-in **web interface** that allows full control
+and monitoring of the system via a browser.
+
+The Web UI runs **directly on the receiver** and is available whenever the
+device is connected to WiFi.
+
+### Features
+
+- Toggle relay outputs **SW0–SW3**
+- Select the **auto-off relay**
+- Start and control the **sequence**
+- View live system status:
+  - Relay states
+  - Auto-off selection
+  - Sequence state
+  - Last received command
+  - LoRa RSSI
+  - WiFi SSID and IP address
+- Trigger **WiFi reset** (Captive Portal) remotely
+
+### Access
+
+After the receiver is connected to WiFi, open in your browser:
+
+http://your-IP-address/
+
+If mDNS is supported by your system, you can also use:
+
+http://lora-receiver.local/
+
+### Authentication
+
+The Web UI is protected using **HTTP Basic Authentication**.
+
+Default credentials (can be changed in the receiver sketch):
+
+- **Username:** `admin`
+- **Password:** `admin123`
+
+### Endpoints (overview)
+
+| URL | Description |
+|----|-------------|
+| `/` | Landing page (status & links) |
+| `/ui` | Full Web UI (authenticated) |
+| `/ping` | Health check (returns `OK`) |
+| `/api/state` | JSON system state |
+| `/api/toggle?ch=x` | Toggle relay `x` |
+| `/api/aof?ch=x` | Set auto-off relay |
+| `/api/seq/start` | Start sequence |
+| `/api/seq/skip` | Skip current sequence step |
+| `/api/wifi/reset` | Reset WiFi & reboot |
+
+> **Note:**  
+> The Web UI is intended for **local network use**.  
+> For remote access from outside the LAN, use a **VPN** (recommended).
+
+---
+
 ## State Synchronization
 
 The receiver is the **single source of truth**.
