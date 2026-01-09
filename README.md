@@ -53,6 +53,35 @@ Both devices communicate via **LoRa** and stay fully synchronized.
 - Menu button cycles the auto-off relay by sending  
   `AOF x`
 
+### Sequence Control (Receiver)
+
+The receiver supports a **built-in timed sequence**:
+
+1. **SW0 ON** for 10 seconds  
+2. **Wait 15 seconds**  
+3. **SW1 ON** for 10 seconds  
+4. Sequence ends automatically
+
+#### Sequence start
+
+- The sequence is started remotely:
+  - via the **sender**
+  - or via the **Web UI**
+
+#### Sequence shortening / skipping (GPIO14)
+
+While a sequence is running, **GPIO14** on the receiver has a special function:
+
+- If pressed during **SW0 phase**  
+  → SW0 is turned OFF immediately and the sequence continues with the 15 s wait
+- If pressed during **SW1 phase**  
+  → SW1 is turned OFF immediately and the sequence finishes
+
+This allows the sequence to be **shortened without aborting it completely**.
+
+> GPIO14 does **not cancel** the sequence.  
+> It only skips the **current active step** and keeps timing logic intact.
+
 ### Sender OLED shows
 
 - `AUTO: SWx` – selected auto-off relay
@@ -105,6 +134,34 @@ and monitoring of the system via a browser.
 
 The Web UI runs **directly on the receiver** and is available whenever the
 device is connected to WiFi.
+
+### Forced WiFi Captive Portal (GPIO14 at boot)
+
+The receiver uses **WiFiManager** to handle WiFi configuration.
+
+If the device is already configured but the network is unavailable,
+the Captive Portal can be **forced manually**:
+
+#### How to force the portal
+
+1. Power OFF the receiver
+2. **Press and hold GPIO14**
+3. Power ON the receiver
+4. Keep GPIO14 pressed for ~1 second
+5. Release the button
+
+The receiver will:
+
+- erase stored WiFi credentials
+- start the **WiFiManager Captive Portal**
+- wait until new WiFi credentials are saved
+- reboot automatically
+
+This works **even if the device was previously connected to a different network**.
+
+> GPIO14 therefore has **two roles** on the receiver:
+> - **During boot:** force WiFi Captive Portal  
+> - **During runtime:** shorten an active sequence step
 
 ### Features
 
@@ -228,6 +285,10 @@ Change this value to adjust the auto-off delay.
 
 GPIO `34` / `35` are intentionally **not used**  
 (input-only, no internal pull-ups).
+
+- Menu / control button: `14`
+  - Runtime: sequence step skip
+  - Boot: force WiFi Captive Portal
 
 ---
 
