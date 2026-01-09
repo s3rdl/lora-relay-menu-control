@@ -21,7 +21,8 @@ Both devices communicate via **LoRa** and stay fully synchronized.
     - Hold **GPIO14** while powering on
     - Connect to the Captive Portal and configure WiFi
 5. Open the Web UI in a browser:
-   http://yourip-address/, or http://lora-receiver.local/
+   - `http://<receiver-ip>/`
+   - or `http://lora-receiver.local/` *(if mDNS is available on your system)*
 6. Control relays via:
     - sender buttons
     - receiver buttons
