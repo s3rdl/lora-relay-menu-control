@@ -28,6 +28,13 @@ int pinsSw[4] = {2, 15, 13, 12};
 #define LED_PIN 25
 const unsigned long LED_PULSE_MS = 120;
 
+// Heartbeat
+const unsigned long HEARTBEAT_INTERVAL_MS = 5000UL;
+const unsigned long HEARTBEAT_PULSE_MS    = 50UL;
+unsigned long heartbeatNextAt = 0;
+bool heartbeatLedOn = false;
+unsigned long heartbeatLedOffAt = 0;
+
 // Debounce
 const unsigned long DEBOUNCE_MS = 30;
 const unsigned long MENU_DEBOUNCE_MS = 50;
@@ -35,10 +42,16 @@ const unsigned long MENU_DEBOUNCE_MS = 50;
 // SYNC display timing
 const unsigned long SYNC_SHOW_MS = 800;
 
+// Display idle
+const unsigned long DISPLAY_IDLE_MS = 10000UL;
+bool displayOn = true;
+unsigned long lastActivityAt = 0;
+
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
 String status = "WAITING...";
 String lastTx = "";
+String lastEvt = "";     // <-- NEW (shows INF ...)
 int lastOne = 5;
 
 // UI layout
@@ -55,7 +68,7 @@ int autoOffRelayIndex = 3;
 int linkRssi = 0;
 bool haveLinkRssi = false;
 
-// SYNC status timing
+// status timing
 unsigned long statusUntil = 0;
 
 struct Button {
@@ -73,6 +86,45 @@ bool ledOn = false;
 unsigned long ledUntil = 0;
 
 // ----------------- helpers -----------------
+void noteActivity() {
+  lastActivityAt = millis();
+  if (!displayOn) {
+    display.ssd1306_command(SSD1306_DISPLAYON);
+    displayOn = true;
+    drawUI();
+  }
+}
+
+void displayPowerService() {
+  if (!displayOn) return;
+  unsigned long now = millis();
+  if ((long)(now - lastActivityAt) >= (long)DISPLAY_IDLE_MS) {
+    display.ssd1306_command(SSD1306_DISPLAYOFF);
+    displayOn = false;
+  }
+}
+
+void heartbeatService() {
+  unsigned long now = millis();
+
+  if (heartbeatLedOn && (long)(now - heartbeatLedOffAt) >= 0) {
+    // Only turn off if we are not in a send pulse
+    if (!ledOn) digitalWrite(LED_PIN, LOW);
+    heartbeatLedOn = false;
+  }
+
+  if (!heartbeatLedOn && (long)(now - heartbeatNextAt) >= 0) {
+    // If send pulse is active, skip this heartbeat cycle
+    if (ledOn) {
+      heartbeatNextAt = now + HEARTBEAT_INTERVAL_MS;
+      return;
+    }
+    digitalWrite(LED_PIN, HIGH);
+    heartbeatLedOn = true;
+    heartbeatLedOffAt = now + HEARTBEAT_PULSE_MS;
+    heartbeatNextAt = now + HEARTBEAT_INTERVAL_MS;
+  }
+}
 
 void setBrightness(uint8_t contrast) {
   display.ssd1306_command(SSD1306_SETCONTRAST);
@@ -87,7 +139,8 @@ void ledPulse() {
 
 void ledService() {
   if (ledOn && (long)(millis() - ledUntil) >= 0) {
-    digitalWrite(LED_PIN, LOW);
+    // If heartbeat currently wants LED ON, keep it on
+    if (!heartbeatLedOn) digitalWrite(LED_PIN, LOW);
     ledOn = false;
   }
 }
@@ -123,8 +176,9 @@ void statusService() {
 }
 
 // ----------------- UI -----------------
-
 void drawUI() {
+  if (!displayOn) return;
+
   display.clearDisplay();
   display.setCursor(0, 4);
   display.setTextColor(1);
@@ -144,6 +198,14 @@ void drawUI() {
 
   display.setCursor(0, 46);
   display.print(status);
+
+  // NEW: last event line
+  display.setCursor(0, 56);
+  display.print("EVT:");
+  // show a short tail to fit on screen
+  String e = lastEvt;
+  if (e.length() > 16) e = e.substring(0, 16);
+  display.print(e);
 
   // Right box
   display.fillRect(68, 0, 60, 2, 1);
@@ -182,8 +244,9 @@ void drawUI() {
 }
 
 // ----------------- LoRa -----------------
-
 void sendPacket(const String &out) {
+  noteActivity();
+
   lastTx = out;
   setStatusTemp("SENDING...", 300);
   ledPulse();
@@ -197,6 +260,8 @@ void handleIncoming() {
   int packetSize = LoRa.parsePacket();
   if (!packetSize) return;
 
+  noteActivity();
+
   String incoming = "";
   while (LoRa.available()) incoming += (char)LoRa.read();
   incoming.trim();
@@ -204,7 +269,15 @@ void handleIncoming() {
   linkRssi = LoRa.packetRssi();
   haveLinkRssi = true;
 
-  // --- STATE SYNC ---
+  // NEW: show info/event messages from receiver (e.g. web actions)
+  if (incoming.startsWith("INF ")) {
+    lastEvt = incoming.substring(4);
+    setStatusTemp("EVENT", 600);
+    drawUI();
+    return;
+  }
+
+  // STATE SYNC
   if (incoming.startsWith("STA ") && incoming.length() >= 8) {
     for (int i = 0; i < 4; i++) {
       char c = incoming.charAt(4 + i);
@@ -214,7 +287,7 @@ void handleIncoming() {
     return;
   }
 
-  // --- Auto-off confirm ---
+  // Auto-off confirm
   if (incoming.startsWith("AOF ") && incoming.length() >= 5) {
     int idx = incoming.charAt(4) - '0';
     if (idx >= 0 && idx < 4) {
@@ -226,7 +299,6 @@ void handleIncoming() {
 }
 
 // ----------------- setup / loop -----------------
-
 void setup() {
   pinMode(LED_PIN, OUTPUT);
   digitalWrite(LED_PIN, LOW);
@@ -258,30 +330,45 @@ void setup() {
   LoRa.setSyncWord(120);
   LoRa.setTxPower(20, PA_OUTPUT_PA_BOOST_PIN);
 
+  displayOn = true;
+  lastActivityAt = millis();
+  heartbeatNextAt = millis() + HEARTBEAT_INTERVAL_MS;
+
   sendPacket("GET 0");   // initial sync
   drawUI();
 }
 
 void loop() {
   ledService();
+  heartbeatService();
   statusService();
   handleIncoming();
 
-  // Relay buttons
+  // Relay buttons:
+  // SW0 starts sequence, SW1..SW3 send CNG
   for (int i = 0; i < 4; i++) {
     if (debounceUpdate(btn[i], DEBOUNCE_MS)) {
       if (btn[i].lastStable == HIGH && btn[i].stable == LOW) {
+        noteActivity();
         lastOne = i;
-        sendPacket("CNG " + String(i));
+        if (i == 0) {
+          sendPacket("SEQ 0");
+          setStatusTemp("SEQ START", 600);
+        } else {
+          sendPacket("CNG " + String(i));
+        }
       }
     }
   }
 
-  // Menu button
+  // Menu button cycles auto-off relay
   if (debounceUpdate(menuBtn, MENU_DEBOUNCE_MS)) {
     if (menuBtn.lastStable == HIGH && menuBtn.stable == LOW) {
+      noteActivity();
       autoOffRelayIndex = (autoOffRelayIndex + 1) % 4;
       sendPacket("AOF " + String(autoOffRelayIndex));
     }
   }
+
+  displayPowerService();
 }

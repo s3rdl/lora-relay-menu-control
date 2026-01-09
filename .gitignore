@@ -1,19 +1,18 @@
-# Arduino / build artifacts
+# Arduino / ESP32
 *.bin
-*.hex
 *.elf
+*.hex
 *.map
 
 # Arduino IDE
+*.ino~
 *.tmp
-*~
-.DS_Store
+*.bak
 
 # VSCode / PlatformIO
 .vscode/
 .pio/
-.pioenvs/
-.piolibdeps/
 
 # OS
+.DS_Store
 Thumbs.db
