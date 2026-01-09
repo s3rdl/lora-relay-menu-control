@@ -328,22 +328,44 @@ GPIO `34` / `35` are intentionally **not used**
 
 This project is licensed under the **GNU General Public License v3.0 (GPL-3.0)**.
 
-Commercial use is permitted **only under a separate commercial license**.
+You are free to use, modify, and redistribute this project under the terms of
+the GPL-3.0 license.
 
-If you are interested in using this project in a commercial product or service,
-please contact the author to obtain a commercial license.
+### Dual Licensing / Commercial Use
+
+Commercial use of this project **requires a separate commercial license**.
+
+If you intend to use this software in a commercial product, service, or
+closed-source environment, please contact the author to obtain a commercial
+license.
+
+This dual-licensing model ensures that the project remains open and free
+for the community, while allowing fair commercial use under separate terms.
 
 ## Credits and Attribution
 
-This project was inspired by the work of **VolosR** and the project
+This project is inspired by the work of **VolosR** and the project  
 [loraRealySwitch](https://github.com/VolosR/loraRealySwitch).
 
-The overall idea, visual concepts, and UI inspiration originated from this work
-and were independently reimplemented and extended in this project.
+The original project provided the initial idea, visual concepts, and general
+approach for a LoRa-based relay controller with OLED UI.
 
-The file `myFonts.h` originates from the same source.
-No license information was provided in the original repository.
-It is included here with full attribution to the original author.
+Parts of this project were **independently reimplemented and significantly
+extended**, including:
 
-If the original author requests changes regarding attribution or licensing,
-this repository will be updated accordingly.
+- bi-directional state synchronization
+- auto-off logic
+- timed relay sequences
+- Web UI with WiFi configuration and Captive Portal
+- system status LEDs and monitoring
+- improved UI logic and robustness
+
+### Fonts (`myFonts.h`)
+
+The file `myFonts.h` originates from the original **VolosR** project and is used
+in this repository with the **explicit permission of the original author**.
+
+Full credit for the font definitions and original inclusion goes to **VolosR**.
+
+If future licensing or attribution requirements arise, this repository will be
+updated accordingly.
