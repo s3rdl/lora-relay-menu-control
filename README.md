@@ -360,7 +360,7 @@ extended**, including:
 - system status LEDs and monitoring
 - improved UI logic and robustness
 
-## Thamks
+## Thanks
 This project was developed with extensive experimentation, iteration, and the help of open-source tools and discussions. Special thanks to everyone who contributes to an open and collaborative ecosystem.
 
 ### Fonts (`myFonts.h`)
