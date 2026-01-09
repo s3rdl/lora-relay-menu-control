@@ -324,6 +324,15 @@ GPIO `34` / `35` are intentionally **not used**
 
 ---
 
+## License
+
+This project is licensed under the **GNU General Public License v3.0 (GPL-3.0)**.
+
+Commercial use is permitted **only under a separate commercial license**.
+
+If you are interested in using this project in a commercial product or service,
+please contact the author to obtain a commercial license.
+
 ## Credits and Attribution
 
 This project was inspired by the work of **VolosR** and the project
