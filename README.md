@@ -22,6 +22,13 @@ Both devices communicate via **LoRa** and stay fully synchronized.
 - OLED UI on both boards
 - GPL-3.0 licensed
 
+## LED Status (green LED, GPIO25)
+
+| Pattern | Meaning |
+|------|--------|
+| 1× short blink / 5 s | Link OK, idle |
+| 1× short blink / 1 s | Active (TX/RX, Web, buttons, sequence) |
+| Double blink | LoRa link lost / no packets |
 ---
 
 ## Sender
