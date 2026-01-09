@@ -326,7 +326,11 @@ GPIO `34` / `35` are intentionally **not used**
 
 ## License
 
-This project is licensed under the  
-**GNU General Public License v3.0 (GPL-3.0)**.
+## License
+
+This project is licensed under the GNU General Public License v3.0 (GPL-3.0).
+
+Commercial use is permitted only under a separate commercial license.
+Please contact the author for commercial licensing options.
 
 https://www.gnu.org/licenses/gpl-3.0.en.html
