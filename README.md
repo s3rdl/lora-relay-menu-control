@@ -12,6 +12,23 @@ Both devices communicate via **LoRa** and stay fully synchronized.
 
 ---
 
+## Quick Start
+
+1. Flash `receiver/receiver.ino` to a **TTGO LoRa32** board  
+2. Flash `sender/sender.ino` to a second **TTGO LoRa32**
+3. Power both devices
+4. If the receiver has no WiFi configured:
+    - Hold **GPIO14** while powering on
+    - Connect to the Captive Portal and configure WiFi
+5. Open the Web UI in a browser:
+   http://yourip-address/, or http://lora-receiver.local/
+6. Control relays via:
+    - sender buttons
+    - receiver buttons
+    - Web UI
+
+The system synchronizes relay states automatically.
+
 ## Features (Overview)
 
 - 4 logical relay channels (**SW0–SW3**)
