@@ -324,13 +324,17 @@ GPIO `34` / `35` are intentionally **not used**
 
 ---
 
-## License
+## Credits and Attribution
 
-## License
+This project was inspired by the work of **VolosR** and the project
+[loraRealySwitch](https://github.com/VolosR/loraRealySwitch).
 
-This project is licensed under the GNU General Public License v3.0 (GPL-3.0).
+The overall idea, visual concepts, and UI inspiration originated from this work
+and were independently reimplemented and extended in this project.
 
-Commercial use is permitted only under a separate commercial license.
-Please contact the author for commercial licensing options.
+The file `myFonts.h` originates from the same source.
+No license information was provided in the original repository.
+It is included here with full attribution to the original author.
 
-https://www.gnu.org/licenses/gpl-3.0.en.html
+If the original author requests changes regarding attribution or licensing,
+this repository will be updated accordingly.
