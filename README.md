@@ -360,6 +360,9 @@ extended**, including:
 - system status LEDs and monitoring
 - improved UI logic and robustness
 
+## Thamks
+This project was developed with extensive experimentation, iteration, and the help of open-source tools and discussions. Special thanks to everyone who contributes to an open and collaborative ecosystem.
+
 ### Fonts (`myFonts.h`)
 
 The file `myFonts.h` originates from the original **VolosR** project and is used
