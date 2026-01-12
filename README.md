@@ -300,7 +300,7 @@ The default sequence consists of the following steps:
 
 These timings are defined via constants in the receiver sketch:
 
-```cpp
+
 const unsigned long SEQ_SW0_ON_MS   = 10000UL;  // SW0 active time
 const unsigned long SEQ_WAIT_MS    = 15000UL;  // delay between steps
 const unsigned long SEQ_SW1_ON_MS  = 10000UL;  // SW1 active time
