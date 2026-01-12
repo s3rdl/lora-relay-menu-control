@@ -288,6 +288,25 @@ Change this value to adjust the auto-off delay.
 
 ---
 
+## Sequence Timing
+
+The timed relay sequence is fully configurable in the receiver sketch.
+
+The default sequence consists of the following steps:
+
+1. **SW0 ON** for 10 seconds  
+2. **Wait** for 15 seconds  
+3. **SW1 ON** for 10 seconds  
+
+These timings are defined via constants in the receiver sketch:
+
+```cpp
+const unsigned long SEQ_SW0_ON_MS   = 10000UL;  // SW0 active time
+const unsigned long SEQ_WAIT_MS    = 15000UL;  // delay between steps
+const unsigned long SEQ_SW1_ON_MS  = 10000UL;  // SW1 active time
+
+---
+
 ## Wiring Summary
 
 ### Sender
