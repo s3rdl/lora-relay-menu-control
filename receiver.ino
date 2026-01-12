@@ -1,12 +1,12 @@
-// receiver/receiver.ino (FULL) — Web UI + WiFiManager + LoRa relay controller
-// Changes in this version:
-// - Sequence restart is re-armed automatically when the sequence finishes,
-//   even if GPIO14 is still held LOW (pressed / tied to GND).
-// - Removed “re-arm only after GPIO14 released” logic.
-// - Keeps SW1-on start blocking.
-// - Web UI PROGMEM is served via server.send_P() (prevents crashes).
-// - I2C timeout/clock set to avoid OLED/I2C hangs.
-// - WiFi state machine uses small delay/yield airbags to avoid WDT.
+// receiver/receiver.ino (FULL) — FIXED Web-UI Start (no more “connected but no UI”)
+// Key fixes:
+// 1) startWebServer() EXISTS and is called as soon as WiFi.isConnected() becomes true (in loop).
+// 2) server.handleClient() runs continuously when webRunning==true.
+// 3) WiFi.setSleep(false) to avoid flaky connectivity on some routers.
+// 4) Force-Portal at boot (GPIO14 hold ~1.2s) uses BLOCKING portal (guaranteed).
+// 5) 60s connect-try, then non-blocking portal.
+// 6) Web endpoint: POST /api/wifi/reset (BasicAuth) resets creds + reboot.
+// 7) Display sleep only turns OLED off (does NOT touch WiFi).
 // LED meaning (GREEN LED, GPIO25)
 // 1× short blink every 5 s  -> Link OK, idle
 // 1× short blink every 1 s  -> Active (TX/RX, Web, buttons, sequence)
@@ -33,7 +33,6 @@
 #define OLED_RESET    -1
 #define I2C_SDA       21
 #define I2C_SCL       22
-
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
 // ---------------- LoRa (TTGO LoRa32) ----------------
@@ -49,11 +48,10 @@ int pinsSw[4] = {2, 15, 13, 12};   // relay outputs (active LOW)
 #define MENU_BTN_PIN 14            // shared: skip/menu button to GND
 
 // ---------------- WiFi Recovery (A) ----------------
-// Hold GPIO14 at boot ~1.2s -> force portal + reset saved WiFi
 #define WIFI_FORCE_PORTAL_PIN 14
 const unsigned long WIFI_FORCE_HOLD_MS = 1200UL;
 
-// ---------------- LED STATUS (single controllable LED) ----------------
+// ---------------- LED STATUS ----------------
 #define LED_PIN 25
 
 const unsigned long LINK_TIMEOUT_MS   = 8000UL;
@@ -169,10 +167,9 @@ unsigned long seqNextAt = 0;
 bool skipSw0 = false;
 bool skipSw1 = false;
 
-// Restart gating:
-// - disarm on start
-// - re-arm on finish (even if GPIO14 is held LOW)
-bool seqRestartArmed = true;
+// Restart gating (modified behavior)
+bool seqCompleted = true;
+bool seqRestartArmed = true;    // NOW: will be re-armed immediately on finish (phase 2 end)
 
 bool lastMenuLevel = HIGH;
 unsigned long lastSkipAt = 0;
@@ -374,6 +371,21 @@ void setAutoOffRelay(int idx, bool publish) {
 }
 
 void handleCng(int n) {
+  // Block SW0/SW1 during sequence
+  if (seqActive && (n == 0 || n == 1)) {
+    LoraMsg = "BLOCK CNG " + String(n) + " (SEQ)";
+    noteActivity(); ledMarkActivity();
+    drawUI();
+
+    // Optional: tell sender & ack
+    sendInfoToSender(LoraMsg);
+    sendPacket("ERR CNG " + String(n) + " SEQ");
+
+    // Re-publish current state so UI stays in sync
+    publishState(false);
+    return;
+  }
+
   states[n] = !states[n];
   applyRelayOutput(n);
   if (n == autoOffRelayIndex) autoOffOnMillis = states[n] ? millis() : 0;
@@ -386,7 +398,6 @@ void handleCng(int n) {
 
 // ---------------- Sequence ----------------
 void startSequence() {
-  // Block if already running
   if (seqActive) {
     LoraMsg = "SEQ BLOCK RUN";
     drawUI();
@@ -394,7 +405,6 @@ void startSequence() {
     return;
   }
 
-  // Block if SW1 already ON (your requirement)
   if (states[1]) {
     LoraMsg = "SEQ BLOCK SW1";
     drawUI();
@@ -402,15 +412,14 @@ void startSequence() {
     return;
   }
 
-  // Disallow restart until previous sequence is finished
   if (!seqRestartArmed) {
-    LoraMsg = "SEQ BLOCKED";
+    LoraMsg = "SEQ BLOCK BTN";
     drawUI();
-    sendPacket("ERR SEQ BLOCKED");
+    sendPacket("ERR SEQ BTN");
     return;
   }
 
-  // Arm is consumed for this run
+  seqCompleted = false;
   seqRestartArmed = false;
 
   seqActive = true;
@@ -418,7 +427,6 @@ void startSequence() {
   skipSw0 = false;
   skipSw1 = false;
 
-  // SW0 ON 10s
   states[0] = 1;
   applyRelayOutput(0);
   publishState(false);
@@ -446,8 +454,9 @@ void requestSkipViaGPIO14() {
 void finishSequence() {
   seqActive = false;
   seqPhase = 3;
+  seqCompleted = true;
 
-  // Re-arm restart immediately when finished (GPIO14 level does not matter)
+  // ✅ CHANGE: re-arm restart immediately when phase=2 ends
   seqRestartArmed = true;
 
   LoraMsg = "SEQ DONE";
@@ -617,7 +626,7 @@ refresh();
 </body></html>
 )HTML";
 
-// ---------------- Web Server (FIXED) ----------------
+// ---------------- Web Server ----------------
 void startWebServer() {
   if (webRunning) return;
 
@@ -759,8 +768,8 @@ void wifiService() {
     if (wifiState != WIFI_CONNECTED) {
       wifiState = WIFI_CONNECTED;
 
-      WiFi.setSleep(false);     // stability
-      WiFi.mode(WIFI_STA);      // ensure AP off in normal mode
+      WiFi.setSleep(false);
+      WiFi.mode(WIFI_STA);
 
       LoraMsg = "WiFi OK " + WiFi.localIP().toString();
       noteActivity(); ledMarkActivity();
@@ -795,7 +804,6 @@ void wifiService() {
 // ---------------- setup / loop ----------------
 void setup() {
   Serial.begin(115200);
-
   printResetReason();
 
   pinMode(LED_PIN, OUTPUT);
@@ -824,8 +832,6 @@ void setup() {
   if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) while (1);
   display.display();
   setBrightness(70);
-
-  // I2C hardening
   Wire.setClock(400000);
   Wire.setTimeout(50);
 
@@ -845,7 +851,6 @@ void setup() {
 
   WiFi.setSleep(false);
 
-  // A) Force portal at boot (GPIO14 hold)
   bool forcePortal = isForcePortalHeldAtBoot();
   if (forcePortal) {
     Serial.println("[WIFI] FORCE portal requested (GPIO14 held). Resetting WiFi...");
@@ -868,15 +873,12 @@ void setup() {
 void loop() {
   delay(2);
 
-  // Always keep WiFi state machine running
   wifiService();
 
-  // Start web server as soon as WiFi is connected
   if (WiFi.isConnected() && !webRunning) {
     startWebServer();
   }
 
-  // Always handle web requests if running
   if (webRunning) {
     server.handleClient();
   }
@@ -921,31 +923,25 @@ void loop() {
     LoraMsg.trim();
     rssi = LoRa.packetRssi();
 
-    if (seqActive) {
-      if (LoraMsg.startsWith("GET")) publishState(true);
-      // SEQ while running is ignored (already active)
-      drawUI();
-    } else {
-      if (LoraMsg.startsWith("CNG ") && LoraMsg.length() >= 5) {
-        int n = LoraMsg.charAt(4) - '0';
-        if (n >= 0 && n < 4) handleCng(n);
-        else drawUI();
-      }
-      else if (LoraMsg.startsWith("AOF ") && LoraMsg.length() >= 5) {
-        int idx = LoraMsg.charAt(4) - '0';
-        if (idx >= 0 && idx < 4) setAutoOffRelay(idx, true);
-        else drawUI();
-      }
-      else if (LoraMsg.startsWith("SEQ")) {
-        startSequence();
-      }
-      else if (LoraMsg.startsWith("GET")) {
-        publishState(true);
-        drawUI();
-      }
-      else {
-        drawUI();
-      }
+  if (LoraMsg.startsWith("CNG ") && LoraMsg.length() >= 5) {
+    int n = LoraMsg.charAt(4) - '0';
+    if (n >= 0 && n < 4) handleCng(n);
+    else drawUI();
+  }
+  else if (LoraMsg.startsWith("AOF ") && LoraMsg.length() >= 5) {
+    int idx = LoraMsg.charAt(4) - '0';
+    if (idx >= 0 && idx < 4) setAutoOffRelay(idx, true);
+    else drawUI();
+  }
+  else if (LoraMsg.startsWith("SEQ")) {
+    startSequence();
+  }
+  else if (LoraMsg.startsWith("GET")) {
+    publishState(true);
+    drawUI();
+  }
+  else {
+    drawUI();
     }
   }
 
