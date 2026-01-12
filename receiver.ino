@@ -1,12 +1,12 @@
-// receiver/receiver.ino (FULL) — FIXED Web-UI Start (no more “connected but no UI”)
-// Key fixes:
-// 1) startWebServer() EXISTS and is called as soon as WiFi.isConnected() becomes true (in loop).
-// 2) server.handleClient() runs continuously when webRunning==true.
-// 3) WiFi.setSleep(false) to avoid flaky connectivity on some routers.
-// 4) Force-Portal at boot (GPIO14 hold ~1.2s) uses BLOCKING portal (guaranteed).
-// 5) 60s connect-try, then non-blocking portal.
-// 6) Web endpoint: POST /api/wifi/reset (BasicAuth) resets creds + reboot.
-// 7) Display sleep only turns OLED off (does NOT touch WiFi).
+// receiver/receiver.ino (FULL) — Web UI + WiFiManager + LoRa relay controller
+// Changes in this version:
+// - Sequence restart is re-armed automatically when the sequence finishes,
+//   even if GPIO14 is still held LOW (pressed / tied to GND).
+// - Removed “re-arm only after GPIO14 released” logic.
+// - Keeps SW1-on start blocking.
+// - Web UI PROGMEM is served via server.send_P() (prevents crashes).
+// - I2C timeout/clock set to avoid OLED/I2C hangs.
+// - WiFi state machine uses small delay/yield airbags to avoid WDT.
 // LED meaning (GREEN LED, GPIO25)
 // 1× short blink every 5 s  -> Link OK, idle
 // 1× short blink every 1 s  -> Active (TX/RX, Web, buttons, sequence)
@@ -25,6 +25,7 @@
 #include <Adafruit_SSD1306.h>
 #include <Fonts/FreeSans9pt7b.h>
 #include "myFonts.h"
+#include <esp_system.h>
 
 // ---------------- OLED ----------------
 #define SCREEN_WIDTH 128
@@ -72,6 +73,12 @@ unsigned long lastActivityAtLed = 0;
 unsigned long ledNextAt = 0;
 uint8_t ledPhase = 0;
 bool ledIsOn = false;
+
+void printResetReason() {
+  esp_reset_reason_t r = esp_reset_reason();
+  Serial.print("RESET REASON: ");
+  Serial.println((int)r);
+}
 
 void ledMarkActivity() { lastActivityAtLed = millis(); }
 
@@ -157,11 +164,15 @@ unsigned long autoOffOnMillis = 0;
 
 // ---------------- Sequence ----------------
 bool seqActive = false;
-uint8_t seqPhase = 0;               // 0 SW0 ON, 1 WAIT, 2 SW1 ON, 3 DONE
+uint8_t seqPhase = 0;
 unsigned long seqNextAt = 0;
-
 bool skipSw0 = false;
 bool skipSw1 = false;
+
+// Restart gating:
+// - disarm on start
+// - re-arm on finish (even if GPIO14 is held LOW)
+bool seqRestartArmed = true;
 
 bool lastMenuLevel = HIGH;
 unsigned long lastSkipAt = 0;
@@ -253,7 +264,9 @@ void publishState(bool alsoConfirmAof) {
 }
 
 String jsonState() {
-  String j = "{";
+  String j;
+  j.reserve(256);
+  j = "{";
   j += "\"sta\":\"";
   for (int i=0;i<4;i++) j += (states[i] ? '1' : '0');
   j += "\",";
@@ -373,20 +386,47 @@ void handleCng(int n) {
 
 // ---------------- Sequence ----------------
 void startSequence() {
+  // Block if already running
+  if (seqActive) {
+    LoraMsg = "SEQ BLOCK RUN";
+    drawUI();
+    sendPacket("ERR SEQ RUNNING");
+    return;
+  }
+
+  // Block if SW1 already ON (your requirement)
+  if (states[1]) {
+    LoraMsg = "SEQ BLOCK SW1";
+    drawUI();
+    sendPacket("ERR SEQ SW1ON");
+    return;
+  }
+
+  // Disallow restart until previous sequence is finished
+  if (!seqRestartArmed) {
+    LoraMsg = "SEQ BLOCKED";
+    drawUI();
+    sendPacket("ERR SEQ BLOCKED");
+    return;
+  }
+
+  // Arm is consumed for this run
+  seqRestartArmed = false;
+
   seqActive = true;
   seqPhase = 0;
   skipSw0 = false;
   skipSw1 = false;
-  autoOffOnMillis = 0;
 
+  // SW0 ON 10s
   states[0] = 1;
   applyRelayOutput(0);
+  publishState(false);
+
   seqNextAt = millis() + 10000UL;
 
   LoraMsg = "SEQ SW0 ON";
-  noteActivity(); ledMarkActivity();
   drawUI();
-  publishState(false);
 }
 
 void requestSkipViaGPIO14() {
@@ -406,8 +446,11 @@ void requestSkipViaGPIO14() {
 void finishSequence() {
   seqActive = false;
   seqPhase = 3;
+
+  // Re-arm restart immediately when finished (GPIO14 level does not matter)
+  seqRestartArmed = true;
+
   LoraMsg = "SEQ DONE";
-  noteActivity(); ledMarkActivity();
   drawUI();
   publishState(false);
 }
@@ -581,7 +624,7 @@ void startWebServer() {
   server.on("/", HTTP_GET, []() {
     if (!ensureAuth()) return;
     noteActivity();
-    server.send(200, "text/html", INDEX_HTML);
+    server.send_P(200, "text/html", INDEX_HTML);
   });
 
   server.on("/api/state", HTTP_GET, []() {
@@ -737,17 +780,23 @@ void wifiService() {
       delay(100);
       wifiStartPortalNonBlocking();
     }
+    delay(1);
+    yield();
     return;
   }
 
   if (wifiState == WIFI_PORTAL) {
     if (portalRunning) wm.process();
+    delay(1);
+    yield();
   }
 }
 
 // ---------------- setup / loop ----------------
 void setup() {
   Serial.begin(115200);
+
+  printResetReason();
 
   pinMode(LED_PIN, OUTPUT);
   digitalWrite(LED_PIN, LOW);
@@ -775,6 +824,10 @@ void setup() {
   if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) while (1);
   display.display();
   setBrightness(70);
+
+  // I2C hardening
+  Wire.setClock(400000);
+  Wire.setTimeout(50);
 
   // LoRa init
   SPI.begin(CONFIG_CLK, CONFIG_MISO, CONFIG_MOSI, CONFIG_NSS);
@@ -818,7 +871,7 @@ void loop() {
   // Always keep WiFi state machine running
   wifiService();
 
-  // FIX: Start web server as soon as WiFi is connected (independent of wifiService internals)
+  // Start web server as soon as WiFi is connected
   if (WiFi.isConnected() && !webRunning) {
     startWebServer();
   }
@@ -870,7 +923,7 @@ void loop() {
 
     if (seqActive) {
       if (LoraMsg.startsWith("GET")) publishState(true);
-      else if (LoraMsg.startsWith("SEQ")) startSequence();
+      // SEQ while running is ignored (already active)
       drawUI();
     } else {
       if (LoraMsg.startsWith("CNG ") && LoraMsg.length() >= 5) {
@@ -916,20 +969,4 @@ void loop() {
   }
 
   displayPowerService();
-
-  // Optional debug every 5s (uncomment if needed)
-  /*
-  static unsigned long dbg = 0;
-  if (millis() - dbg > 5000) {
-    dbg = millis();
-    Serial.print("[DBG] WiFi=");
-    Serial.print(WiFi.isConnected() ? "OK " : "NO ");
-    Serial.print("IP=");
-    Serial.print(WiFi.isConnected() ? WiFi.localIP().toString() : "0.0.0.0");
-    Serial.print(" webRunning=");
-    Serial.print(webRunning ? "true" : "false");
-    Serial.print(" displayOn=");
-    Serial.println(displayOn ? "true" : "false");
-  }
-  */
 }
