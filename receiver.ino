@@ -1,16 +1,13 @@
-// receiver/receiver.ino (FULL) — FIXED Web-UI Start (no more “connected but no UI”)
-// Key fixes:
-// 1) startWebServer() EXISTS and is called as soon as WiFi.isConnected() becomes true (in loop).
-// 2) server.handleClient() runs continuously when webRunning==true.
-// 3) WiFi.setSleep(false) to avoid flaky connectivity on some routers.
-// 4) Force-Portal at boot (GPIO14 hold ~1.2s) uses BLOCKING portal (guaranteed).
-// 5) 60s connect-try, then non-blocking portal.
-// 6) Web endpoint: POST /api/wifi/reset (BasicAuth) resets creds + reboot.
-// 7) Display sleep only turns OLED off (does NOT touch WiFi).
-// LED meaning (GREEN LED, GPIO25)
-// 1× short blink every 5 s  -> Link OK, idle
-// 1× short blink every 1 s  -> Active (TX/RX, Web, buttons, sequence)
-// Double blink              -> LoRa link lost / no packets
+// receiver/receiver.ino (FULL) — OLED layout fixed + Battery (VBAT) measurement + Info cycling
+// - Relay boxes moved to 2x2 on the LEFT (no overlap with right info panel)
+// - Right panel now shows LAST MSG + WiFi SSID + IP (readable, no wrapping over graphics)
+// - Info box cycles every 2s: RSSI -> AUTO -> VBAT
+// - VBAT measured via ADC (default GPIO35 on many TTGO LoRa32 boards)
+//
+// Notes:
+// - If your board uses a different VBAT ADC pin, change BAT_ADC_PIN below.
+// - VBAT measurement uses analogReadMilliVolts() and assumes an on-board divider (often ~2:1).
+//   Adjust BAT_DIVIDER and BAT_CAL if needed.
 
 #include <Wire.h>
 #include <SPI.h>
@@ -33,6 +30,7 @@
 #define OLED_RESET    -1
 #define I2C_SDA       21
 #define I2C_SCL       22
+
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
 // ---------------- LoRa (TTGO LoRa32) ----------------
@@ -47,11 +45,26 @@ Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 int pinsSw[4] = {2, 15, 13, 12};   // relay outputs (active LOW)
 #define MENU_BTN_PIN 14            // shared: skip/menu button to GND
 
+// ---------------- Battery (VBAT) ----------------
+// Many TTGO LoRa32 boards expose battery divider to GPIO35.
+// If yours differs, change this.
+#define BAT_ADC_PIN 35
+
+// Divider + calibration (adjust if your readings are off)
+const float BAT_DIVIDER = 2.0f;     // on-board divider often ~2:1
+const float BAT_CAL     = 1.00f;    // calibration factor
+
+const unsigned long BAT_READ_MS = 2000UL;
+unsigned long nextBatReadAt = 0;
+float vbat = 0.0f;
+bool haveVbat = false;
+
 // ---------------- WiFi Recovery (A) ----------------
+// Hold GPIO14 at boot ~1.2s -> force portal + reset saved WiFi
 #define WIFI_FORCE_PORTAL_PIN 14
 const unsigned long WIFI_FORCE_HOLD_MS = 1200UL;
 
-// ---------------- LED STATUS ----------------
+// ---------------- LED STATUS (single controllable LED) ----------------
 #define LED_PIN 25
 
 const unsigned long LINK_TIMEOUT_MS   = 8000UL;
@@ -144,8 +157,10 @@ void ledStatusServiceReceiver(bool seqActive) {
 const unsigned long AUTO_OFF_DURATION_MS = 10000UL;
 const unsigned long MENU_DEBOUNCE_MS = 50;
 
+// Info cycling (RSSI -> AUTO -> VBAT)
 const unsigned long INFO_TOGGLE_MS = 2000UL;
-bool showRssiInfo = true;
+enum InfoMode { INFO_RSSI, INFO_AUTO, INFO_VBAT };
+InfoMode infoMode = INFO_RSSI;
 unsigned long nextInfoToggleAt = 0;
 
 // Display idle timeout (OLED only)
@@ -162,14 +177,14 @@ unsigned long autoOffOnMillis = 0;
 
 // ---------------- Sequence ----------------
 bool seqActive = false;
-uint8_t seqPhase = 0;
+uint8_t seqPhase = 0;              // 0: SW0 ON, 1: wait, 2: SW1 ON, 3: done
 unsigned long seqNextAt = 0;
 bool skipSw0 = false;
 bool skipSw1 = false;
 
-// Restart gating (modified behavior)
-bool seqCompleted = true;
-bool seqRestartArmed = true;    // NOW: will be re-armed immediately on finish (phase 2 end)
+// restart gating
+bool seqCompleted = true;       // becomes false on start, true on finish
+bool seqRestartArmed = true;    // start only allowed if true
 
 bool lastMenuLevel = HIGH;
 unsigned long lastSkipAt = 0;
@@ -260,9 +275,14 @@ void publishState(bool alsoConfirmAof) {
   sendPacket(makeSta());
 }
 
+static String safeMsgShort(const String &in, uint8_t maxLen) {
+  if ((int)in.length() <= maxLen) return in;
+  return in.substring(0, maxLen);
+}
+
 String jsonState() {
   String j;
-  j.reserve(256);
+  j.reserve(320);
   j = "{";
   j += "\"sta\":\"";
   for (int i=0;i<4;i++) j += (states[i] ? '1' : '0');
@@ -271,6 +291,7 @@ String jsonState() {
   j += "\"seqActive\":" + String(seqActive ? "true":"false") + ",";
   j += "\"seqPhase\":" + String(seqPhase) + ",";
   j += "\"rssi\":" + String(rssi) + ",";
+  j += "\"vbat\":" + String(haveVbat ? vbat : 0.0f, 2) + ",";
   j += "\"lastMsg\":\"";
   String m = LoraMsg; m.replace("\"","'");
   j += m;
@@ -285,18 +306,38 @@ String jsonState() {
   return j;
 }
 
-// ---------------- UI ----------------
-void drawUI() {
-  if (!displayOn) return;
+// ---------------- Battery ----------------
+float readBatteryVoltage() {
+  // analogReadMilliVolts() exists in ESP32 Arduino core
+  uint32_t mv = analogReadMilliVolts(BAT_ADC_PIN);   // millivolts at ADC pin
+  float v = (mv / 1000.0f) * BAT_DIVIDER * BAT_CAL;  // compensate divider & calibration
+  return v;
+}
 
-  display.clearDisplay();
-  display.setCursor(0, 4);
-  display.setTextColor(1);
+void batteryService() {
+  unsigned long now = millis();
+  if ((long)(now - nextBatReadAt) < 0) return;
+  nextBatReadAt = now + BAT_READ_MS;
 
-  display.setFont(&DejaVu_Sans_Mono_Bold_12);
-  display.printf("RECEIVER");
-  display.setFont(NULL);
+  float vb = readBatteryVoltage();
+  // sanity clamp
+  if (vb > 0.5f && vb < 6.0f) {
+    vbat = vb;
+    haveVbat = true;
+  }
+}
 
+// ---------------- UI (fixed layout) ----------------
+// Layout:
+// Left area: x 0..67
+// Right area: x 68..127
+//
+// - Left top: title (shared) + info box
+// - Right panel: LAST MSG + WiFi + IP
+// - Bottom left: 2x2 relay boxes (SW0..SW3)
+
+void drawRightPanel() {
+  // right panel frame accents
   display.fillRect(68, 0, 60, 2, 1);
 
   for (int i = 68; i < 128; i++)
@@ -305,56 +346,138 @@ void drawUI() {
   for (int i = 4; i < 32; i++)
     if (i % 2 == 0) { display.drawPixel(68, i, 1); display.drawPixel(127, i, 1); }
 
+  // --- LAST ---
   display.setTextColor(1);
   display.setCursor(72, 8);
-  display.printf("LAST MSG ");
+  display.print("LAST");
 
-  display.setCursor(72, 20);
-  display.print(LoraMsg);
+  display.setCursor(72, 18);
+  display.print(safeMsgShort(LoraMsg, 10));
 
+  // --- WiFi (moved down) ---
+  display.setCursor(72, 36);
+  if (WiFi.isConnected()) {
+    String ss = WiFi.SSID();
+    if (ss.length() > 12) {
+    ss = ss.substring(0, 12);
+  }
+  display.setCursor(72, 36);
+  display.print(ss);
+  } else {
+    display.print("WiFi:OFF");
+  }
+
+  // --- IP (two lines, no "IP:" label) ---
+  String ip = WiFi.isConnected() ? WiFi.localIP().toString() : String("0.0.0.0");
+  int lastDot = ip.lastIndexOf('.');
+  String ipLine1 = ip;
+  String ipLine2 = "";
+  int d1 = ip.indexOf('.');
+  int d2 = ip.indexOf('.', d1 + 1);
+  int d3 = ip.indexOf('.', d2 + 1);
+  if (d1 > 0 && d2 > d1 && d3 > d2) {
+    // erste zwei Oktette
+    ipLine1 = ip.substring(0, d2);      // "192.168"
+    // letzte zwei Oktette
+    ipLine2 = ip.substring(d2 + 1);     // "178.133"
+  }
+
+  display.setCursor(72, 44);
+  display.print(ipLine1);
+
+  display.setCursor(72, 54);
+  display.print(ipLine2);
+}
+
+void drawInfoBox() {
+  // Info box in original RSSI position (left top)
   display.fillRect(0, 14, 62, 18, 1);
   display.setTextColor(0);
   display.setCursor(3, 21);
 
-  if (showRssiInfo) {
+  if (infoMode == INFO_RSSI) {
     display.print("RSSI:");
-    display.fillRect(32, 19, 28, 11, 0);
+    display.fillRect(32, 19, 30, 11, 0);
     display.setTextColor(1);
     display.setCursor(34, 21);
     display.print(String(rssi));
-  } else {
+  } else if (infoMode == INFO_AUTO) {
     display.print("AUTO:");
-    display.fillRect(32, 19, 28, 11, 0);
+    display.fillRect(32, 19, 30, 11, 0);
     display.setTextColor(1);
     display.setCursor(34, 21);
     display.print("SW");
     display.print(autoOffRelayIndex);
+  } else { // INFO_VBAT
+    display.print("VBAT:");
+    display.fillRect(32, 19, 30, 11, 0);
+    display.setTextColor(1);
+    display.setCursor(34, 21);
+    if (haveVbat) {
+      // show like 3.98
+      display.print(String(vbat, 2));
+    } else {
+      display.print("N/A");
+    }
   }
+}
+
+void drawRelayBoxes2x2() {
+  // left area width ~68, make 2 columns, 2 rows
+  const int x0 = 0;
+  const int y0 = 34;
+  const int w  = 32;
+  const int h  = 14;
+  const int gapX = 2;
+  const int gapY = 2;
 
   for (int i = 0; i < 4; i++) {
-    if (states[i]) display.fillRoundRect(i * 33, 36, 28, 28, 4, 1);
-    else display.drawRoundRect(i * 33, 36, 28, 28, 4, 1);
+    int col = (i % 2);
+    int row = (i / 2);
+    int x = x0 + col * (w + gapX);
+    int y = y0 + row * (h + gapY);
+
+    if (states[i]) display.fillRoundRect(x, y, w, h, 3, 1);
+    else display.drawRoundRect(x, y, w, h, 3, 1);
 
     display.setFont(NULL);
     display.setTextColor(!states[i]);
-    display.setCursor(4 + (i * 33), 40);
-    display.print("SW" + String(i));
+    display.setCursor(x + 3, y + 4);
+    display.print("SW");
+    display.print(i);
 
-    display.setFont(&DejaVu_Sans_Mono_Bold_12);
-    display.setCursor(12 + (i * 33), 59);
-    display.print(states[i]);
-
-    display.drawRoundRect(i * 33, 36, 28, 28, 4, 1);
+    display.setTextColor(!states[i]);
+    display.setCursor(x + 24, y + 4);
+    display.print(states[i] ? "1" : "0");
   }
+}
 
+void drawUI() {
+  if (!displayOn) return;
+
+  display.clearDisplay();
+  display.setCursor(0, 4);
+  display.setTextColor(1);
+
+  display.setFont(&DejaVu_Sans_Mono_Bold_12);
+  display.print("RECEIVER");
   display.setFont(NULL);
+
+  drawRightPanel();
+  drawInfoBox();
+  drawRelayBoxes2x2();
+
   display.display();
 }
 
 void infoToggleService() {
   unsigned long now = millis();
   if ((long)(now - nextInfoToggleAt) >= 0) {
-    showRssiInfo = !showRssiInfo;
+    // cycle RSSI -> AUTO -> VBAT -> RSSI ...
+    if (infoMode == INFO_RSSI) infoMode = INFO_AUTO;
+    else if (infoMode == INFO_AUTO) infoMode = INFO_VBAT;
+    else infoMode = INFO_RSSI;
+
     nextInfoToggleAt = now + INFO_TOGGLE_MS;
     drawUI();
   }
@@ -371,18 +494,12 @@ void setAutoOffRelay(int idx, bool publish) {
 }
 
 void handleCng(int n) {
-  // Block SW0/SW1 during sequence
+  // Option: block SW0/SW1 toggles during sequence (safety)
   if (seqActive && (n == 0 || n == 1)) {
-    LoraMsg = "BLOCK CNG " + String(n) + " (SEQ)";
+    LoraMsg = "BLK CNG SW" + String(n);
     noteActivity(); ledMarkActivity();
     drawUI();
-
-    // Optional: tell sender & ack
-    sendInfoToSender(LoraMsg);
-    sendPacket("ERR CNG " + String(n) + " SEQ");
-
-    // Re-publish current state so UI stays in sync
-    publishState(false);
+    sendPacket("ERR SEQ BLK");
     return;
   }
 
@@ -397,6 +514,22 @@ void handleCng(int n) {
 }
 
 // ---------------- Sequence ----------------
+void finishSequence() {
+  seqActive = false;
+  seqPhase = 3;
+  seqCompleted = true;
+
+  LoraMsg = "SEQ DONE";
+  drawUI();
+  publishState(false);
+
+  // IMPORTANT per your latest requirement:
+  // restart becomes allowed again immediately after the sequence ends (phase=2 completed),
+  // even if GPIO14 is LOW again.
+  // So we re-arm right here.
+  seqRestartArmed = true;
+}
+
 void startSequence() {
   if (seqActive) {
     LoraMsg = "SEQ BLOCK RUN";
@@ -427,6 +560,7 @@ void startSequence() {
   skipSw0 = false;
   skipSw1 = false;
 
+  // SW0 ON 10s
   states[0] = 1;
   applyRelayOutput(0);
   publishState(false);
@@ -434,6 +568,7 @@ void startSequence() {
   seqNextAt = millis() + 10000UL;
 
   LoraMsg = "SEQ SW0 ON";
+  noteActivity(); ledMarkActivity();
   drawUI();
 }
 
@@ -449,19 +584,6 @@ void requestSkipViaGPIO14() {
 
   noteActivity(); ledMarkActivity();
   drawUI();
-}
-
-void finishSequence() {
-  seqActive = false;
-  seqPhase = 3;
-  seqCompleted = true;
-
-  // ✅ CHANGE: re-arm restart immediately when phase=2 ends
-  seqRestartArmed = true;
-
-  LoraMsg = "SEQ DONE";
-  drawUI();
-  publishState(false);
 }
 
 void sequenceService() {
@@ -555,6 +677,7 @@ small{color:var(--muted)}
   <div><b>WiFi</b>: <span id="wifi" class="mono"></span></div>
   <div><b>IP</b>: <span id="ip" class="mono"></span></div>
   <div><b>RSSI</b>: <span id="rssi" class="mono"></span></div>
+  <div><b>VBAT</b>: <span id="vbat" class="mono"></span> V</div>
   <div><b>Last</b>: <span id="last" class="mono"></span></div>
 </div>
 
@@ -607,6 +730,7 @@ async function refresh(){
   document.getElementById('wifi').textContent = j.wifi;
   document.getElementById('ip').textContent = j.ip;
   document.getElementById('rssi').textContent = j.rssi;
+  document.getElementById('vbat').textContent = (j.vbat || 0).toFixed ? j.vbat.toFixed(2) : j.vbat;
   document.getElementById('last').textContent = j.lastMsg;
   document.getElementById('sta').textContent = j.sta;
   document.getElementById('aof').textContent = "SW"+j.autoOff;
@@ -701,7 +825,7 @@ void startWebServer() {
   server.begin();
   webRunning = true;
 
-  LoraMsg = "WEB UP " + WiFi.localIP().toString();
+  LoraMsg = "WEB UP";
   noteActivity(); ledMarkActivity();
   drawUI();
   publishState(true);
@@ -712,7 +836,7 @@ void startWebServer() {
   Serial.println("/");
 }
 
-// ---------------- WiFi Portal functions ----------------
+// ---------------- WiFi Portal ----------------
 void wifiStartPortalNonBlocking() {
   wm.setCaptivePortalEnable(true);
   wm.setConnectTimeout(10);
@@ -728,7 +852,6 @@ void wifiStartPortalNonBlocking() {
   Serial.println(portalRunning ? "STARTED" : "FAILED");
 }
 
-// GUARANTEED portal (blocking), used for forced portal at boot
 void wifiStartPortalBlockingForce() {
   wm.setCaptivePortalEnable(true);
   wm.setConnectTimeout(10);
@@ -762,7 +885,6 @@ void wifiStartTryConnect() {
   Serial.println("[WIFI] Trying stored credentials...");
 }
 
-// Main WiFi service (never blocks)
 void wifiService() {
   if (WiFi.isConnected()) {
     if (wifiState != WIFI_CONNECTED) {
@@ -771,7 +893,7 @@ void wifiService() {
       WiFi.setSleep(false);
       WiFi.mode(WIFI_STA);
 
-      LoraMsg = "WiFi OK " + WiFi.localIP().toString();
+      LoraMsg = "WiFi OK";
       noteActivity(); ledMarkActivity();
       drawUI();
       publishState(true);
@@ -829,11 +951,17 @@ void setup() {
   nextInfoToggleAt = millis() + INFO_TOGGLE_MS;
 
   Wire.begin(I2C_SDA, I2C_SCL);
+  Wire.setClock(400000);
+  Wire.setTimeout(50);
+
   if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) while (1);
   display.display();
   setBrightness(70);
-  Wire.setClock(400000);
-  Wire.setTimeout(50);
+
+  // Battery ADC init
+  analogReadResolution(12);
+  analogSetPinAttenuation(BAT_ADC_PIN, ADC_11db);
+  nextBatReadAt = millis() + 200;
 
   // LoRa init
   SPI.begin(CONFIG_CLK, CONFIG_MISO, CONFIG_MOSI, CONFIG_NSS);
@@ -873,15 +1001,13 @@ void setup() {
 void loop() {
   delay(2);
 
+  batteryService();          // <-- VBAT update (every 2s)
   wifiService();
 
   if (WiFi.isConnected() && !webRunning) {
     startWebServer();
   }
-
-  if (webRunning) {
-    server.handleClient();
-  }
+  if (webRunning) server.handleClient();
 
   ledStatusServiceReceiver(seqActive);
   sequenceService();
@@ -923,25 +1049,32 @@ void loop() {
     LoraMsg.trim();
     rssi = LoRa.packetRssi();
 
-  if (LoraMsg.startsWith("CNG ") && LoraMsg.length() >= 5) {
-    int n = LoraMsg.charAt(4) - '0';
-    if (n >= 0 && n < 4) handleCng(n);
-    else drawUI();
-  }
-  else if (LoraMsg.startsWith("AOF ") && LoraMsg.length() >= 5) {
-    int idx = LoraMsg.charAt(4) - '0';
-    if (idx >= 0 && idx < 4) setAutoOffRelay(idx, true);
-    else drawUI();
-  }
-  else if (LoraMsg.startsWith("SEQ")) {
-    startSequence();
-  }
-  else if (LoraMsg.startsWith("GET")) {
-    publishState(true);
-    drawUI();
-  }
-  else {
-    drawUI();
+    if (seqActive) {
+      // during sequence: block toggles for SW0/SW1, still allow GET
+      if (LoraMsg.startsWith("GET")) publishState(true);
+      else if (LoraMsg.startsWith("SEQ")) startSequence();
+      drawUI();
+    } else {
+      if (LoraMsg.startsWith("CNG ") && LoraMsg.length() >= 5) {
+        int n = LoraMsg.charAt(4) - '0';
+        if (n >= 0 && n < 4) handleCng(n);
+        else drawUI();
+      }
+      else if (LoraMsg.startsWith("AOF ") && LoraMsg.length() >= 5) {
+        int idx = LoraMsg.charAt(4) - '0';
+        if (idx >= 0 && idx < 4) setAutoOffRelay(idx, true);
+        else drawUI();
+      }
+      else if (LoraMsg.startsWith("SEQ")) {
+        startSequence();
+      }
+      else if (LoraMsg.startsWith("GET")) {
+        publishState(true);
+        drawUI();
+      }
+      else {
+        drawUI();
+      }
     }
   }
 
