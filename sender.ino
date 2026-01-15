@@ -6,13 +6,16 @@
 #include <Fonts/FreeSans9pt7b.h>
 #include "myFonts.h"
 
+// ---------------- Display ----------------
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 64
 #define OLED_RESET    -1
 #define I2C_SDA       21
 #define I2C_SCL       22
 
-// LoRa pins (TTGO LoRa32)
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+// ---------------- LoRa (TTGO LoRa32) ----------------
 #define CONFIG_MOSI 27
 #define CONFIG_MISO 19
 #define CONFIG_CLK  5
@@ -20,57 +23,59 @@
 #define CONFIG_RST  23
 #define CONFIG_DIO0 26
 
-// Buttons
+// ---------------- Buttons ----------------
 int pinsSw[4] = {2, 15, 13, 12};
 #define MENU_BTN_PIN 14   // GPIO14 -> GND
 
-// LED
+// ---------------- LED ----------------
 #define LED_PIN 25
 const unsigned long LED_PULSE_MS = 120;
 
-// Heartbeat
-const unsigned long HEARTBEAT_INTERVAL_MS = 5000UL;
-const unsigned long HEARTBEAT_PULSE_MS    = 50UL;
-unsigned long heartbeatNextAt = 0;
-bool heartbeatLedOn = false;
-unsigned long heartbeatLedOffAt = 0;
-
-// Debounce
+// ---------------- Debounce ----------------
 const unsigned long DEBOUNCE_MS = 30;
 const unsigned long MENU_DEBOUNCE_MS = 50;
 
-// SYNC display timing
+// ---------------- Status timing ----------------
 const unsigned long SYNC_SHOW_MS = 800;
+const unsigned long ERR_SHOW_MS  = 1200;
 
-// Display idle
-const unsigned long DISPLAY_IDLE_MS = 10000UL;
-bool displayOn = true;
-unsigned long lastActivityAt = 0;
+// ---------------- Battery (TTGO LoRa32) ----------------
+// Most TTGO LoRa32 revisions expose VBAT via a divider to GPIO35 (sometimes GPIO34).
+#define BAT_ADC_PIN 35
+const unsigned long BAT_SAMPLE_MS = 2000UL;
 
-Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+// Li-ion thresholds (adjust if needed)
+const float VBAT_EMPTY = 3.20f;
+const float VBAT_FULL  = 4.20f;
+const float VBAT_LOW   = 3.45f;   // warning threshold
 
+// Low-bat blink
+const unsigned long LOWBAT_BLINK_MS = 600UL;
+
+float vbat = 0.0f;           // filtered
+float vbatRaw = 0.0f;        // last raw reading
+unsigned long nextBatSampleAt = 0;
+bool lowBat = false;
+bool lowBatBlink = false;
+unsigned long nextLowBatBlinkAt = 0;
+
+// ---------------- UI / State ----------------
 String status = "WAITING...";
 String lastTx = "";
-String lastEvt = "";     // <-- NEW (shows INF ...)
 int lastOne = 5;
 
-// UI layout
 int xpos[4] = {90, 110, 90, 110};
 int ypos[4] = {36, 36, 52, 52};
 
-// Real relay states (from receiver only!)
 bool states[4] = {0, 0, 0, 0};
-
-// Auto-off selection
 int autoOffRelayIndex = 3;
 
-// RSSI
 int linkRssi = 0;
 bool haveLinkRssi = false;
 
-// status timing
 unsigned long statusUntil = 0;
 
+// ---------------- Button struct ----------------
 struct Button {
   uint8_t pin;
   bool raw;
@@ -85,47 +90,9 @@ Button menuBtn;
 bool ledOn = false;
 unsigned long ledUntil = 0;
 
-// ----------------- helpers -----------------
-void noteActivity() {
-  lastActivityAt = millis();
-  if (!displayOn) {
-    display.ssd1306_command(SSD1306_DISPLAYON);
-    displayOn = true;
-    drawUI();
-  }
-}
-
-void displayPowerService() {
-  if (!displayOn) return;
-  unsigned long now = millis();
-  if ((long)(now - lastActivityAt) >= (long)DISPLAY_IDLE_MS) {
-    display.ssd1306_command(SSD1306_DISPLAYOFF);
-    displayOn = false;
-  }
-}
-
-void heartbeatService() {
-  unsigned long now = millis();
-
-  if (heartbeatLedOn && (long)(now - heartbeatLedOffAt) >= 0) {
-    // Only turn off if we are not in a send pulse
-    if (!ledOn) digitalWrite(LED_PIN, LOW);
-    heartbeatLedOn = false;
-  }
-
-  if (!heartbeatLedOn && (long)(now - heartbeatNextAt) >= 0) {
-    // If send pulse is active, skip this heartbeat cycle
-    if (ledOn) {
-      heartbeatNextAt = now + HEARTBEAT_INTERVAL_MS;
-      return;
-    }
-    digitalWrite(LED_PIN, HIGH);
-    heartbeatLedOn = true;
-    heartbeatLedOffAt = now + HEARTBEAT_PULSE_MS;
-    heartbeatNextAt = now + HEARTBEAT_INTERVAL_MS;
-  }
-}
-
+// ============================================================================
+// Helpers
+// ============================================================================
 void setBrightness(uint8_t contrast) {
   display.ssd1306_command(SSD1306_SETCONTRAST);
   display.ssd1306_command(contrast);
@@ -139,8 +106,7 @@ void ledPulse() {
 
 void ledService() {
   if (ledOn && (long)(millis() - ledUntil) >= 0) {
-    // If heartbeat currently wants LED ON, keep it on
-    if (!heartbeatLedOn) digitalWrite(LED_PIN, LOW);
+    digitalWrite(LED_PIN, LOW);
     ledOn = false;
   }
 }
@@ -175,10 +141,100 @@ void statusService() {
   }
 }
 
-// ----------------- UI -----------------
-void drawUI() {
-  if (!displayOn) return;
+// ============================================================================
+// Battery
+// ============================================================================
+static float clampf(float v, float lo, float hi) {
+  if (v < lo) return lo;
+  if (v > hi) return hi;
+  return v;
+}
 
+float readBatteryVoltage() {
+  analogSetPinAttenuation(BAT_ADC_PIN, ADC_11db);
+  delay(2);
+
+  uint32_t sum = 0;
+  const int N = 8;
+  for (int i = 0; i < N; i++) {
+    sum += analogRead(BAT_ADC_PIN);
+    delay(2);
+  }
+
+  float raw = (float)sum / (float)N;
+
+  // ADC pin voltage (approx)
+  float vAdc = (raw / 4095.0f) * 3.3f;
+
+  // Divider compensation (TTGO typical)
+  float vBat = vAdc * 2.0f;
+
+  return vBat;
+}
+
+uint8_t batteryBars(float v) {
+  // map VBAT_EMPTY..VBAT_FULL -> 0..4
+  float vv = clampf(v, VBAT_EMPTY, VBAT_FULL);
+  float p = (vv - VBAT_EMPTY) / (VBAT_FULL - VBAT_EMPTY); // 0..1
+  int bars = (int)(p * 4.0f + 0.5f);
+  if (bars < 0) bars = 0;
+  if (bars > 4) bars = 4;
+  return (uint8_t)bars;
+}
+
+void batteryService() {
+  unsigned long now = millis();
+
+  // sample
+  if ((long)(now - nextBatSampleAt) >= 0) {
+    nextBatSampleAt = now + BAT_SAMPLE_MS;
+
+    vbatRaw = readBatteryVoltage();
+
+    // simple low-pass filter (80% old, 20% new)
+    if (vbat < 0.1f) vbat = vbatRaw;
+    else vbat = (vbat * 0.80f) + (vbatRaw * 0.20f);
+
+    lowBat = (vbat > 0.1f && vbat <= VBAT_LOW);
+
+    drawUI();
+  }
+
+  // blink state for low battery indicator
+  if (lowBat && (long)(now - nextLowBatBlinkAt) >= 0) {
+    nextLowBatBlinkAt = now + LOWBAT_BLINK_MS;
+    lowBatBlink = !lowBatBlink;
+    drawUI();
+  }
+  if (!lowBat) {
+    lowBatBlink = false;
+  }
+}
+
+// ============================================================================
+// UI (Battery Icon + LowBat)
+// ============================================================================
+void drawBatteryIcon(int x, int y, uint8_t bars, bool warnBlink) {
+  // battery outline: 18x8 + tip
+  // Outline
+  display.drawRect(x, y, 18, 8, 1);
+  display.drawRect(x + 18, y + 2, 2, 4, 1);
+
+  // Fill bars (each 3px wide, 1px gap)
+  int bx = x + 2;
+  int by = y + 2;
+  for (int i = 0; i < 4; i++) {
+    if (i < bars) display.fillRect(bx + i * 4, by, 3, 4, 1);
+  }
+
+  // Low-bat warning: blink a small "!" near icon
+  if (warnBlink) {
+    display.setCursor(x - 6, y + 1);
+    display.print("!");
+  }
+}
+
+void drawUI() {
   display.clearDisplay();
   display.setCursor(0, 4);
   display.setTextColor(1);
@@ -187,27 +243,42 @@ void drawUI() {
   display.print("SENDER");
   display.setFont(NULL);
 
+  // Battery icon top-right area (does not collide with right box)
+  // We place it under the top label line on the left side to avoid the panel
+  // But your right panel starts at x=68, so we can place battery at x=48 safely.
+  uint8_t bars = batteryBars(vbat);
+  drawBatteryIcon(60, 35, bars, lowBat && lowBatBlink);
+
   display.setCursor(0, 16);
   display.print("AUTO:SW");
   display.print(autoOffRelayIndex);
 
-  display.setCursor(0, 28);
+  display.setCursor(0, 25);
   display.print("RSSI:");
   if (haveLinkRssi) display.print(linkRssi);
   else display.print("N/A");
 
-  display.setCursor(0, 46);
+  // Battery voltage line below RSSI
+  display.setCursor(0, 35);
+  display.print("BAT:");
+  if (vbat > 0.1f) {
+    display.print(vbat, 2);
+    display.print("V");
+  } else {
+    display.print("N/A");
+  }
+
+  // Low battery text (only when low)
+  if (lowBat) {
+    display.setCursor(0, 44);
+    display.print("LOW BAT!");
+  }
+
+  // Status line (move slightly if low bat is shown)
+  display.setCursor(0, lowBat ? 54 : 46);
   display.print(status);
 
-  // NEW: last event line
-  display.setCursor(0, 56);
-  display.print("EVT:");
-  // show a short tail to fit on screen
-  String e = lastEvt;
-  if (e.length() > 16) e = e.substring(0, 16);
-  display.print(e);
-
-  // Right box
+  // Right panel box
   display.fillRect(68, 0, 60, 2, 1);
 
   for (int i = 68; i < 128; i++)
@@ -243,10 +314,10 @@ void drawUI() {
   display.display();
 }
 
-// ----------------- LoRa -----------------
+// ============================================================================
+// LoRa
+// ============================================================================
 void sendPacket(const String &out) {
-  noteActivity();
-
   lastTx = out;
   setStatusTemp("SENDING...", 300);
   ledPulse();
@@ -260,8 +331,6 @@ void handleIncoming() {
   int packetSize = LoRa.parsePacket();
   if (!packetSize) return;
 
-  noteActivity();
-
   String incoming = "";
   while (LoRa.available()) incoming += (char)LoRa.read();
   incoming.trim();
@@ -269,15 +338,11 @@ void handleIncoming() {
   linkRssi = LoRa.packetRssi();
   haveLinkRssi = true;
 
-  // NEW: show info/event messages from receiver (e.g. web actions)
-  if (incoming.startsWith("INF ")) {
-    lastEvt = incoming.substring(4);
-    setStatusTemp("EVENT", 600);
-    drawUI();
+  if (incoming.startsWith("ERR SEQ")) {
+    setStatusTemp("SEQ BLOCKED", ERR_SHOW_MS);
     return;
   }
 
-  // STATE SYNC
   if (incoming.startsWith("STA ") && incoming.length() >= 8) {
     for (int i = 0; i < 4; i++) {
       char c = incoming.charAt(4 + i);
@@ -287,7 +352,6 @@ void handleIncoming() {
     return;
   }
 
-  // Auto-off confirm
   if (incoming.startsWith("AOF ") && incoming.length() >= 5) {
     int idx = incoming.charAt(4) - '0';
     if (idx >= 0 && idx < 4) {
@@ -298,7 +362,9 @@ void handleIncoming() {
   }
 }
 
-// ----------------- setup / loop -----------------
+// ============================================================================
+// Setup / Loop
+// ============================================================================
 void setup() {
   pinMode(LED_PIN, OUTPUT);
   digitalWrite(LED_PIN, LOW);
@@ -320,6 +386,10 @@ void setup() {
   display.display();
   setBrightness(70);
 
+  analogReadResolution(12);
+  nextBatSampleAt = millis() + 300;
+  nextLowBatBlinkAt = millis() + LOWBAT_BLINK_MS;
+
   SPI.begin(CONFIG_CLK, CONFIG_MISO, CONFIG_MOSI, CONFIG_NSS);
   LoRa.setPins(CONFIG_NSS, CONFIG_RST, CONFIG_DIO0);
   if (!LoRa.begin(868E6)) while (1);
@@ -330,45 +400,31 @@ void setup() {
   LoRa.setSyncWord(120);
   LoRa.setTxPower(20, PA_OUTPUT_PA_BOOST_PIN);
 
-  displayOn = true;
-  lastActivityAt = millis();
-  heartbeatNextAt = millis() + HEARTBEAT_INTERVAL_MS;
-
-  sendPacket("GET 0");   // initial sync
+  sendPacket("GET 0");
   drawUI();
 }
 
 void loop() {
   ledService();
-  heartbeatService();
   statusService();
   handleIncoming();
+  batteryService();
 
-  // Relay buttons:
-  // SW0 starts sequence, SW1..SW3 send CNG
+  // Relay buttons
   for (int i = 0; i < 4; i++) {
     if (debounceUpdate(btn[i], DEBOUNCE_MS)) {
       if (btn[i].lastStable == HIGH && btn[i].stable == LOW) {
-        noteActivity();
         lastOne = i;
-        if (i == 0) {
-          sendPacket("SEQ 0");
-          setStatusTemp("SEQ START", 600);
-        } else {
-          sendPacket("CNG " + String(i));
-        }
+        sendPacket("CNG " + String(i));
       }
     }
   }
 
-  // Menu button cycles auto-off relay
+  // Menu button
   if (debounceUpdate(menuBtn, MENU_DEBOUNCE_MS)) {
     if (menuBtn.lastStable == HIGH && menuBtn.stable == LOW) {
-      noteActivity();
       autoOffRelayIndex = (autoOffRelayIndex + 1) % 4;
       sendPacket("AOF " + String(autoOffRelayIndex));
     }
   }
-
-  displayPowerService();
 }

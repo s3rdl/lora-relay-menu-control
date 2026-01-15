@@ -565,7 +565,7 @@ void startSequence() {
   applyRelayOutput(0);
   publishState(false);
 
-  seqNextAt = millis() + 10000UL;
+  seqNextAt = millis() + 7000UL;
 
   LoraMsg = "SEQ SW0 ON";
   noteActivity(); ledMarkActivity();
@@ -619,7 +619,7 @@ void sequenceService() {
 
   if (seqPhase == 1) {
     states[1] = 1; applyRelayOutput(1); publishState(false);
-    seqPhase = 2; seqNextAt = now + 10000UL;
+    seqPhase = 2; seqNextAt = now + 7000UL;
     LoraMsg = "SEQ SW1 ON";
     noteActivity(); ledMarkActivity(); drawUI();
     return;
